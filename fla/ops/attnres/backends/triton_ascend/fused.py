@@ -46,12 +46,7 @@ def _l_chunk_size(L: int, N: int, D: int, elem_size: int) -> int:
 
 def _flat_residual(r: torch.Tensor, D: int) -> torch.Tensor:
     """View ``[..., D]`` as ``[N, D]`` for the autograd path."""
-    flat = r.view(-1, D)
-    if not flat.is_contiguous():
-        flat = flat.contiguous()
-    if r._base is not None:
-        flat = flat.detach().requires_grad_(True)
-    return flat
+    return r.reshape(-1, D).contiguous()
 
 
 def _stack_sources(sources: Sequence[torch.Tensor], l0: int, l1: int) -> torch.Tensor:
@@ -114,7 +109,7 @@ def _launch_n(
         kernel[(n_len,)](N_OFFSET=n_off, **kwargs)
 
 
-@triton.jit(do_not_specialize=['L', 'N', 'D'])
+@triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
 def attnres_fwd_p1_chunk_kernel(
     q,
     res,
@@ -131,7 +126,7 @@ def attnres_fwd_p1_chunk_kernel(
     scale,
     BL: tl.constexpr,
     BD: tl.constexpr,
-    L_OFFSET: tl.constexpr,
+    L_OFFSET,
     N_OFFSET: tl.constexpr,
 ):
     i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
@@ -168,7 +163,7 @@ def attnres_fwd_p1_chunk_kernel(
     tl.store(chunk_acc + i_n, b_acc)
 
 
-@triton.jit(do_not_specialize=['L', 'N', 'D'])
+@triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
 def attnres_fwd_p2_chunk_kernel(
     res,
     logit,
@@ -181,7 +176,7 @@ def attnres_fwd_p2_chunk_kernel(
     scale,
     BL: tl.constexpr,
     BD: tl.constexpr,
-    L_OFFSET: tl.constexpr,
+    L_OFFSET,
     N_OFFSET: tl.constexpr,
     ACCUM: tl.constexpr,
 ):
@@ -285,7 +280,7 @@ def attnres_bwd_prep_kernel(
     tl.store(b_delta + i_n, b_delta_acc)
 
 
-@triton.jit(do_not_specialize=['L', 'N', 'D'])
+@triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
 def attnres_bwd_dv_chunk_kernel(
     q,
     res,
@@ -304,7 +299,7 @@ def attnres_bwd_dv_chunk_kernel(
     scale,
     BL: tl.constexpr,
     BD: tl.constexpr,
-    L_OFFSET: tl.constexpr,
+    L_OFFSET,
     N_OFFSET: tl.constexpr,
 ):
     i_n = tl.program_id(0).to(tl.int64) + N_OFFSET

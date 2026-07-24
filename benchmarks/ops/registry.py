@@ -494,7 +494,9 @@ def _attnres_post_init(inputs, B, T, H, D, L=None, **kw):
     # fused_attnres expects a sequence of [B, T, D] tensors, not the stacked [L, B, T, D] buffer.
     res = inputs['residuals']
     if isinstance(res, torch.Tensor) and res.ndim == 4:
-        inputs['residuals'] = [res[i] for i in range(res.shape[0])]
+        inputs['residuals'] = [
+            res[i].detach().clone().requires_grad_(True) for i in range(res.shape[0])
+        ]
 
 
 register_op(OpConfig(
