@@ -709,17 +709,20 @@ def chunk_bwd_dqkwg_ref(
 
 
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'HV', 'D', 'dtype'),
+    ('B', 'T', 'H', 'HV', 'D', 'use_g', 'use_w', 'dtype'),
     [
-        pytest.param(B, T, H, HV, D, dtype, id=f"B{B}-T{T}-H{H}-HV{HV}-D{D}-{dtype}")
-        for (B, T, H, HV, D, dtype) in [
-            (2, 128, 2, 2, 64, torch.bfloat16),
-            (2, 128, 2, 4, 64, torch.bfloat16),
-            (1, 256, 4, 4, 32, torch.float16),
+        pytest.param(B, T, H, HV, D, use_g, use_w, dtype,
+                     id=f"B{B}-T{T}-H{H}-HV{HV}-D{D}-use_g{use_g}-use_w{use_w}-{dtype}")
+        for (B, T, H, HV, D, use_g, use_w, dtype) in [
+            (2, 128, 2, 2, 64, True, True, torch.bfloat16),
+            (2, 128, 2, 4, 64, True, True, torch.bfloat16),
+            (1, 256, 4, 4, 32, True, True, torch.float16),
+            (2, 128, 2, 2, 64, False, True, torch.bfloat16),
+            (2, 128, 2, 2, 64, False, False, torch.bfloat16),
         ]
     ],
 )
-def test_chunk_bwd_dqkwg(B: int, T: int, H: int, HV: int, D: int, dtype: torch.dtype):
+def test_chunk_bwd_dqkwg(B: int, T: int, H: int, HV: int, D: int, use_g: bool, use_w: bool, dtype: torch.dtype):
     torch.manual_seed(42)
     BT = 64
     NT = T // BT
@@ -730,9 +733,9 @@ def test_chunk_bwd_dqkwg(B: int, T: int, H: int, HV: int, D: int, dtype: torch.d
     do = torch.randn(B, T, HV, D, dtype=dtype, device=device)
     h = torch.randn(B, NT, HV, D, D, dtype=dtype, device=device)
     dh = torch.randn(B, NT, HV, D, D, dtype=dtype, device=device)
-    w = torch.randn(B, T, HV, D, dtype=dtype, device=device)
-    dv = torch.randn(B, T, HV, D, dtype=dtype, device=device)
-    g = torch.randn(B, T, HV, dtype=torch.float32, device=device) * 0.1
+    w = torch.randn(B, T, HV, D, dtype=dtype, device=device) if use_w else None
+    dv = torch.randn(B, T, HV, D, dtype=dtype, device=device) if use_w else None
+    g = torch.randn(B, T, HV, dtype=torch.float32, device=device) * 0.1 if use_g else None
 
     dq_ref, dk_ref, dw_ref, dg_ref = chunk_bwd_dqkwg_ref(q, k, v_new, do, h, dh, w, dv, g, scale, BT)
     dq_tri, dk_tri, dw_tri, dg_tri = chunk_bwd_dqkwg(
@@ -741,8 +744,14 @@ def test_chunk_bwd_dqkwg(B: int, T: int, H: int, HV: int, D: int, dtype: torch.d
 
     assert_close('dq', dq_ref, dq_tri, 0.006)
     assert_close('dk', dk_ref, dk_tri, 0.006)
-    assert_close('dw', dw_ref, dw_tri, 0.006)
-    assert_close('dg', dg_ref, dg_tri, 0.006)
+    if use_w:
+        assert_close('dw', dw_ref, dw_tri, 0.006)
+    else:
+        assert dw_ref is None and dw_tri is None
+    if use_g:
+        assert_close('dg', dg_ref, dg_tri, 0.006)
+    else:
+        assert dg_ref is None and dg_tri is None
 
 
 def gdn_fwd_torch(
