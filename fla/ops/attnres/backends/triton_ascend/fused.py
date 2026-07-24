@@ -44,6 +44,18 @@ def _l_chunk_size(L: int, N: int, D: int, elem_size: int) -> int:
     return max(1, min(L, _MAX_L_CHUNK_BYTES // layer_bytes))
 
 
+def _flat_residual(r: torch.Tensor, D: int) -> torch.Tensor:
+    """View ``[..., D]`` as ``[N, D]``; detach views into a stacked buffer."""
+    flat = r.view(-1, D)
+    if not flat.is_contiguous():
+        flat = flat.contiguous()
+    # Benchmark feeds ``[L,B,T,D]`` slices; without detach, backward allocates
+    # one contiguous grad for the whole stack (8 GiB at max shape).
+    if flat._base is not None:
+        flat = flat.detach().requires_grad_(True)
+    return flat
+
+
 def _stack_sources(sources: Sequence[torch.Tensor], l0: int, l1: int) -> torch.Tensor:
     if l1 - l0 == 1:
         return sources[l0].unsqueeze(0)
@@ -87,6 +99,11 @@ def _get_bd(row_dim: int, col_dim: int, *, memory_multiplier: float) -> int:
         min_block=64,
         max_block=2048,
     )
+
+
+def _get_bl_bd(ll: int, D: int, *, mem_mult: float) -> tuple[int, int]:
+    bl = _get_bl(ll)
+    return bl, _get_bd(bl, D, memory_multiplier=mem_mult)
 
 
 def _launch_n(
@@ -373,15 +390,22 @@ def attnres_bwd_kernel_dqdw_npu(
         tl.store(dow + o_d, b_dow, mask=m_d)
 
 
-def _accumulate_o_mix(
+def _get_o_mix(
     sources: Sequence[torch.Tensor],
     logit: torch.Tensor,
     lse: torch.Tensor,
-    o_mix: torch.Tensor,
     scale: float,
-) -> None:
+    device: torch.device,
+    o_pre: torch.Tensor | None = None,
+    o_mix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if o_pre is not None:
+        return o_pre
+    if o_mix is None:
+        o_mix = torch.zeros(*sources[0].shape, device=device, dtype=torch.float32)
     first = True
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
+        bl, bd = _get_bl_bd(ll, D, mem_mult=_FWD_MEM_MULT)
         _launch_n(
             attnres_fwd_p2_chunk_kernel,
             N,
@@ -394,28 +418,28 @@ def _accumulate_o_mix(
             D=D,
             stride_ln=stride_ln,
             scale=scale,
-            BL=_get_bl(ll),
-            BD=_get_bd(ll, D, memory_multiplier=_FWD_MEM_MULT),
+            BL=bl,
+            BD=bd,
             L_OFFSET=l0,
             ACCUM=not first,
         )
         first = False
         del chunk
-
-
-def _resolve_o_mix(
-    sources: Sequence[torch.Tensor],
-    o_pre: torch.Tensor | None,
-    logit: torch.Tensor,
-    lse: torch.Tensor,
-    scale: float,
-    device: torch.device,
-) -> torch.Tensor:
-    if o_pre is not None:
-        return o_pre.to(torch.float32)
-    o_mix = torch.zeros(*sources[0].shape, device=device, dtype=torch.float32)
-    _accumulate_o_mix(sources, logit, lse, o_mix, scale)
     return o_mix
+
+
+def _dres_chunk(
+    flat_dvs: list[torch.Tensor | None],
+    sources: Sequence[torch.Tensor],
+    l0: int,
+    ll: int,
+    chunk: torch.Tensor,
+) -> torch.Tensor:
+    if ll == 1:
+        if flat_dvs[l0] is None:
+            flat_dvs[l0] = torch.empty_like(sources[l0])
+        return flat_dvs[l0].unsqueeze(0)
+    return torch.empty_like(chunk)
 
 
 def fused_attnres_fwd_npu(
@@ -442,6 +466,7 @@ def fused_attnres_fwd_npu(
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
         chunk_m = torch.empty(N, device=chunk.device, dtype=torch.float32)
         chunk_acc = torch.empty(N, device=chunk.device, dtype=torch.float32)
+        bl, bd = _get_bl_bd(ll, D, mem_mult=_FWD_MEM_MULT)
         _launch_n(
             attnres_fwd_p1_chunk_kernel,
             N,
@@ -458,19 +483,22 @@ def fused_attnres_fwd_npu(
             stride_ln=stride_ln,
             eps=eps,
             scale=scale,
-            BL=_get_bl(ll),
-            BD=_get_bd(ll, D, memory_multiplier=_FWD_MEM_MULT),
+            BL=bl,
+            BD=bd,
             L_OFFSET=l0,
         )
         m, acc = _merge_online_softmax(m, acc, chunk_m, chunk_acc)
         del chunk, chunk_m, chunk_acc
 
     lse.copy_(m + torch.log(acc))
-    o_mix = torch.zeros(N, D, device=sources[0].device, dtype=torch.float32)
-    _accumulate_o_mix(sources, logit, lse, o_mix, scale)
+    o_mix = _get_o_mix(sources, logit, lse, scale, sources[0].device)
 
     if save_opre:
         o_pre.copy_(o_mix.to(dtype))
+        if ow is None:
+            o.copy_(o_pre)
+    elif ow is None:
+        o.copy_(o_mix.to(dtype))
     if ow is not None:
         _launch_n(
             attnres_fwd_onorm_kernel,
@@ -483,8 +511,6 @@ def fused_attnres_fwd_npu(
             eps=eps,
             BD=_get_bd(1, D, memory_multiplier=2.0),
         )
-    else:
-        o.copy_(o_mix.to(dtype))
     return o, o_pre, rstd, logit, lse
 
 
@@ -492,7 +518,6 @@ def fused_attnres_bwd_npu(
     do: torch.Tensor,
     q: torch.Tensor,
     sources: Sequence[torch.Tensor],
-    flat_dvs: Sequence[torch.Tensor],
     w: torch.Tensor,
     ow: torch.Tensor | None,
     o_pre: torch.Tensor | None,
@@ -502,10 +527,11 @@ def fused_attnres_bwd_npu(
     eps: float,
     scale: float,
     checkpoint_level: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
     del checkpoint_level
     has_onorm = ow is not None
     N, D = do.shape
+    flat_dvs: list[torch.Tensor | None] = [None] * len(sources)
 
     do_eff = torch.empty_like(do, dtype=torch.float32)
     b_delta = torch.empty(N, device=do.device, dtype=torch.float32)
@@ -514,7 +540,7 @@ def fused_attnres_bwd_npu(
     dow = torch.empty_like(ow) if has_onorm else None
     dow_partial = torch.empty_like(do, dtype=torch.float32) if has_onorm else do_eff
 
-    o_mix = _resolve_o_mix(sources, o_pre, logit, lse, scale, do.device)
+    o_mix = _get_o_mix(sources, logit, lse, scale, do.device, o_pre=o_pre)
     _launch_n(
         attnres_bwd_prep_kernel,
         N,
@@ -532,7 +558,8 @@ def fused_attnres_bwd_npu(
     )
 
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
-        chunk_dres = torch.empty_like(chunk)
+        dres = _dres_chunk(flat_dvs, sources, l0, ll, chunk)
+        bl, bd = _get_bl_bd(ll, D, mem_mult=_BWD_DV_MEM_MULT)
         _launch_n(
             attnres_bwd_dv_chunk_kernel,
             N,
@@ -543,7 +570,7 @@ def fused_attnres_bwd_npu(
             logit=logit,
             lse=lse,
             do_eff=do_eff,
-            dres=chunk_dres,
+            dres=dres,
             dqw=dqw,
             b_delta=b_delta,
             L=ll,
@@ -551,13 +578,18 @@ def fused_attnres_bwd_npu(
             D=D,
             stride_ln=stride_ln,
             scale=scale,
-            BL=_get_bl(ll),
-            BD=_get_bd(ll, D, memory_multiplier=_BWD_DV_MEM_MULT),
+            BL=bl,
+            BD=bd,
             L_OFFSET=l0,
         )
-        for i in range(ll):
-            flat_dvs[l0 + i].copy_(chunk_dres[i])
-        del chunk, chunk_dres
+        if ll > 1:
+            for i in range(ll):
+                idx = l0 + i
+                if flat_dvs[idx] is None:
+                    flat_dvs[idx] = torch.empty_like(sources[idx])
+                flat_dvs[idx].copy_(dres[i])
+            del dres
+        del chunk
 
     bd = _get_bd(1, D, memory_multiplier=2.0)
     attnres_bwd_kernel_dqdw_npu[(triton.cdiv(D, bd),)](
@@ -573,7 +605,8 @@ def fused_attnres_bwd_npu(
         BD=bd,
         HAS_ONORM=has_onorm,
     )
-    return dq, dw, dow
+    assert all(t is not None for t in flat_dvs)
+    return dq, dw, dow, flat_dvs  # type: ignore[return-value]
 
 
 class FusedAttnresNpuFunction(torch.autograd.Function):
@@ -610,9 +643,8 @@ class FusedAttnresNpuFunction(torch.autograd.Function):
     def backward(ctx, do: torch.Tensor, dp: torch.Tensor | None = None):
         del dp
         query, rms_weight, output_rms_weight, o_pre, rstd, logit, lse, *residuals = ctx.saved_tensors
-        flat_dvs = [torch.empty_like(r) for r in residuals]
-        dq, dw, dow = fused_attnres_bwd_npu(
-            do, query, residuals, flat_dvs, rms_weight, output_rms_weight,
+        dq, dw, dow, flat_dvs = fused_attnres_bwd_npu(
+            do, query, residuals, rms_weight, output_rms_weight,
             o_pre, rstd, logit, lse, ctx.eps, ctx.scale, ctx.checkpoint_level,
         )
         return (dq, dw, dow, None, None, None, None, *flat_dvs)
@@ -630,7 +662,7 @@ def fused_attnres_npu(
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     output_shape = residuals[0].shape
     D = output_shape[-1]
-    flat = tuple(r.reshape(-1, D).contiguous() for r in residuals)
+    flat = tuple(_flat_residual(r, D) for r in residuals)
     o, p = FusedAttnresNpuFunction.apply(
         query, rms_weight, output_rms_weight, rms_eps, scale,
         return_weights, checkpoint_level, *flat,
