@@ -45,13 +45,11 @@ def _l_chunk_size(L: int, N: int, D: int, elem_size: int) -> int:
 
 
 def _flat_residual(r: torch.Tensor, D: int) -> torch.Tensor:
-    """View ``[..., D]`` as ``[N, D]``; detach views into a stacked buffer."""
+    """View ``[..., D]`` as ``[N, D]`` for the autograd path."""
     flat = r.view(-1, D)
     if not flat.is_contiguous():
         flat = flat.contiguous()
-    # Benchmark feeds ``[L,B,T,D]`` slices; without detach, backward allocates
-    # one contiguous grad for the whole stack (8 GiB at max shape).
-    if flat._base is not None:
+    if r._base is not None:
         flat = flat.detach().requires_grad_(True)
     return flat
 
