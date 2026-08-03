@@ -58,7 +58,7 @@ import torch.multiprocessing as mp
 
 from fla.modules.convolution import causal_conv1d
 from fla.ops.cp import build_cp_context
-from fla.utils import assert_close
+from fla.utils import IS_NPU, assert_close, device_name, device_torch_lib
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -75,8 +75,8 @@ def init_distributed(rank, world_size):
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
 
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="hccl" if IS_NPU else "nccl", rank=rank, world_size=world_size)
+    device_torch_lib.set_device(rank)
 
 
 def cleanup_distributed():
@@ -101,7 +101,7 @@ def run_cp_conv_test_worker(
     """
     try:
         init_distributed(rank, world_size)
-        device = torch.device(f'cuda:{rank}')
+        device = torch.device(f'{device_name}:{rank}')
 
         assert T % world_size == 0, f"T={T} must be divisible by world_size={world_size}"
         assert sum(lengths) == T, f"Sum of lengths {sum(lengths)} must equal T={T}"
@@ -262,8 +262,8 @@ def test_cp2_sequence_cut():
     - Rank 0: tokens [0, 512) contains seq0 (300) + part of seq1 (212)
     - Rank 1: tokens [512, 1024) contains rest of seq1 (188) + seq2 (324)
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -287,8 +287,8 @@ def test_cp2_boundary_aligned():
     - Rank 1: tokens [512, 1024) contains exactly seq1
     - No sequence is split across ranks
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -313,8 +313,8 @@ def test_cp4_complex():
     - Rank 2: [512, 768) - 188 tokens of seq0 + 68 tokens of seq1
     - Rank 3: [768, 1024) - 256 tokens of seq1
     """
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -336,8 +336,8 @@ def test_cp4_single_sequence():
     - lengths=[1024] -> single sequence spans all 4 ranks
     - Each rank processes 256 tokens of the same sequence
     """
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -359,8 +359,8 @@ def test_cp2_many_short_sequences():
     - lengths=[100, 150, 200, 250, 124, 100, 100] -> many short sequences
     - Some sequences are entirely in one rank, some span across
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -391,8 +391,8 @@ def test_cp2_short_tail_len1(backend):
     Rank 0: [0, 512)  → 512 tokens of seq0
     Rank 1: [512, 1024) → 1 token of seq0 (T_local=1!) + 511 tokens of seq1
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -412,8 +412,8 @@ def test_cp2_short_tail_len2(backend):
 
     Rank 1: [512, 1024) → 2 tokens of seq0 (T_local=2!) + 510 tokens of seq1
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -439,8 +439,8 @@ def test_cp4_every_rank_gets_short_tail(backend):
                           seq2=[512,769) → rank2 gets 256, rank3 gets 1
     Rank 3: [768, 1024) → 1 token of seq2 (T=1!) + 255 tokens of seq3
     """
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -462,8 +462,8 @@ def test_cp2_multiple_short_tails(backend):
     Rank 0: [0, 512)   → seq0(200) + 312 tokens of seq1
     Rank 1: [512, 1024) → 1 token of seq1 (T=1!) + 511 tokens of seq2
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -487,8 +487,8 @@ def test_cp2_global_len1_sequence(backend):
     seq1 has no initial_state from prev rank (it starts fresh), but the
     initial_state tensor is still allocated for all seqs on non-first ranks.
     """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -515,8 +515,8 @@ def test_cp4_multiple_short_tails(backend):
 
     Ranks 1 and 2 each have local sequences with T < W=4.
     """
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -540,8 +540,8 @@ def test_cp4_worst_case_many_len1(backend):
     Rank 2: cu_seqlens=[0,256], pre_num_conv_tokens=1 → gradient must be
             masked to only 1 valid position, not all W-1=3.
     """
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -563,7 +563,7 @@ def setup_distributed_torchrun():
     if 'RANK' not in os.environ:
         return False
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="hccl" if IS_NPU else "nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    device_torch_lib.set_device(local_rank)
     return True

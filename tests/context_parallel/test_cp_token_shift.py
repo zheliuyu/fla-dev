@@ -41,7 +41,7 @@ import torch.multiprocessing as mp
 from fla.modules.token_shift import token_shift_ref
 from fla.modules.token_shift_cp import token_shift_cp
 from fla.ops.cp import build_cp_context
-from fla.utils import assert_close
+from fla.utils import IS_NPU, assert_close, device_name, device_torch_lib
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
@@ -56,8 +56,8 @@ def init_distributed(rank, world_size, port):
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
 
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="hccl" if IS_NPU else "nccl", rank=rank, world_size=world_size)
+    device_torch_lib.set_device(rank)
 
 
 def cleanup_distributed():
@@ -79,7 +79,7 @@ def run_cp_token_shift_test_worker(
     """Worker function for CP token shift test."""
     try:
         init_distributed(rank, world_size, port)
-        device = torch.device(f'cuda:{rank}')
+        device = torch.device(f'{device_name}:{rank}')
 
         assert T % world_size == 0, f"T={T} must be divisible by world_size={world_size}"
         assert sum(lengths) == T, f"Sum of lengths {sum(lengths)} must equal T={T}"
@@ -194,8 +194,8 @@ def run_cp_test_with_spawn(
 
 def test_cp2_sequence_cut():
     """CP2: sequences cut across rank boundary."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -208,8 +208,8 @@ def test_cp2_sequence_cut():
 
 def test_cp2_boundary_aligned():
     """CP2: sequence boundaries aligned with rank boundaries."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -222,8 +222,8 @@ def test_cp2_boundary_aligned():
 
 def test_cp4_complex():
     """CP4: complex sequence distribution."""
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -236,8 +236,8 @@ def test_cp4_complex():
 
 def test_cp4_single_sequence():
     """CP4: single long sequence spanning all ranks."""
-    if torch.cuda.device_count() < 4:
-        pytest.skip("At least 4 GPUs required")
+    if device_torch_lib.device_count() < 4:
+        pytest.skip(f"At least 4 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=4,
@@ -250,8 +250,8 @@ def test_cp4_single_sequence():
 
 def test_cp2_many_short_sequences():
     """CP2: many short sequences."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -265,8 +265,8 @@ def test_cp2_many_short_sequences():
 # Edge case: short local segments (T_local = 1 for token shift)
 def test_cp2_short_tail_len1():
     """CP2: rank 1 gets a length-1 tail."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
@@ -279,8 +279,8 @@ def test_cp2_short_tail_len1():
 
 def test_cp2_short_tail_len2():
     """CP2: rank 1 gets a length-2 tail."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("At least 2 GPUs required")
+    if device_torch_lib.device_count() < 2:
+        pytest.skip(f"At least 2 {device_name} devices required")
 
     run_cp_test_with_spawn(
         world_size=2,
